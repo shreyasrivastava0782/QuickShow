@@ -1,0 +1,218 @@
+import axios from "axios";
+import Movie from "../models/Movie.js";
+import Show from "../models/Show.js";
+
+// API to get now playing movies from IMDB API
+export const getNowPlayingMovies = async (req, res) => {
+  try {
+    const options = {
+      method: "GET",
+      url: 'https://imdb236.p.rapidapi.com/api/imdb/search',
+      params: {
+        type: "movie",
+        genre: "Drama",
+        rows: "25",
+        sortOrder: "ASC",
+        sortField: "id",
+      },
+      headers: {
+        "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+        "x-rapidapi-host":process.env.RAPIDAPI_HOST
+      },
+    };
+
+    
+    console.log("🧩 RapidAPI Key:", process.env.RAPIDAPI_KEY);
+    console.log("🧩 RapidAPI Host:", process.env.RAPIDAPI_HOST);
+    const response = await axios.request(options);
+    console.log("🎬 RAW IMDb RESPONSE ===>", JSON.stringify(response.data, null, 2));
+
+    const results = response.data.results || response.data.movies || [];
+
+
+    const movies = results.map((movie) => ({
+      id: movie.id,
+      title: movie.primaryTitle || movie.originalTitle || "Untitled",
+      poster_path: movie.primaryImage || movie.thumbnails?.[0]?.url || "",
+      vote_average: movie.contentRating || 0,
+      vote_count: movie.numVotes || 0,
+      release_date: movie.startYear || "N/A",
+    }));
+
+    res.json({ success: true, movies });
+    // const response = await axios.request(options);
+    // res.json({ success: true, movies: response.data });
+  } catch (error) {
+    console.error("❌ IMDb API Error:", error.response?.data || error.message);
+    res.json({
+      success: false,
+      message: error.response?.data || error.message,
+    });
+  }
+};
+
+
+// API to add a new show
+export const addShow = async (req, res) => {
+  try {
+    const { id } = req.query; // IMDb ID (e.g., tt0816692)
+    const { showsInput, showPrice } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ success: false, message: "IMDb ID is required" });
+    }
+
+    // RapidAPI headers
+    const headers = {
+      "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+      "x-rapidapi-host": process.env.RAPIDAPI_HOST,
+    };
+
+    // Fetch movie details and cast in parallel
+    const detailsUrl = `https://imdb236.p.rapidapi.com/api/imdb/${id}`;
+    const creditsUrl = `https://imdb236.p.rapidapi.com/api/imdb/${id}/cast`;
+
+    const [detailsResponse, creditsResponse] = await Promise.all([
+      axios.get(detailsUrl, { headers }),
+      axios.get(creditsUrl, { headers }),
+    ]);
+
+    const detailsData = detailsResponse.data || {};
+    const creditsData = creditsResponse.data || [];
+
+    console.log("🎬 RAW DETAILS ===>", JSON.stringify(detailsData, null, 2));
+    console.log("🎭 RAW CAST ===>", JSON.stringify(creditsData, null, 2));
+
+    // 🧩 Construct clean movieData based on the actual API response
+    const movieData = {
+      imdbId: detailsData?.id || id,
+      title: detailsData?.primaryTitle || "Unknown Title",
+      originalTitle: detailsData?.originalTitle || "",
+      releaseYear: detailsData?.startYear || new Date().getFullYear(),
+      genres: detailsData?.genres || [],
+      rating: detailsData?.averageRating || null,
+      plot: detailsData?.description || "No description available",
+      image: {
+        url: detailsData?.primaryImage || "",
+      },
+      cast: (creditsData || detailsData?.cast || []).map((actor) => ({
+        id: actor?.id || "",
+        name: actor?.fullName || "Unknown",
+        image: actor?.primaryImage || "",
+        job: actor?.job || "",
+        characters: actor?.characters || [],
+      })),
+      updatedAt: new Date(),
+    };
+
+    console.log("✅ Parsed Movie:", movieData.title, movieData.releaseYear);
+
+    // 🔄 Save or update movie in database
+    const movie = await Movie.findOneAndUpdate(
+      { imdbId: id },
+      { $set: movieData },
+      { upsert: true, new: true }
+    );
+
+    // 🎞 Add showtimes
+    const showDocs = [];
+
+    console.log("🎟 showsInput received:", JSON.stringify(showsInput, null, 2));
+    console.log("💰 showPrice:", showPrice);
+
+    for (const show of showsInput) {
+      const { date, time } = show;
+
+      for (const t of time) {
+        // ✅ Convert "10:00 AM" -> "10:00" and "06:00 PM" -> "18:00"
+        const [timePart, modifier] = t.split(" ");
+        let [hours, minutes] = timePart.split(":").map(Number);
+
+        if (modifier === "PM" && hours < 12) hours += 12;
+        if (modifier === "AM" && hours === 12) hours = 0;
+
+        const isoTime = `${hours.toString().padStart(2, "0")}:${minutes
+          .toString()
+          .padStart(2, "0")}:00`;
+
+        const showDateTime = new Date(`${date}T${isoTime}`);
+
+        if (isNaN(showDateTime)) {
+          console.warn("⚠️ Invalid show time skipped:", date, t);
+          continue;
+        }
+
+        showDocs.push({
+          movie: movie._id,
+          showDateTime,
+          showPrice,
+        });
+      }
+    }
+
+    if (showDocs.length) {
+      await Show.insertMany(showDocs);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Show added successfully",
+      movie,
+    });
+  } catch (error) {
+    console.error("❌ Error adding show:", error.message);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+//ApI to get all shows from the database
+export const getShows=async(req,res)=>{
+  try {
+    const shows = await Show.find({showDateTime:{$gte:new Date()}}).populate
+    ('movie').sort({showDateTime:1});
+
+    //filter unique shows
+    const uniqueShows=new Set(shows.map(show=>show.movie))
+
+    res.json({success:true,shows:Array.from(uniqueShows)})
+  } catch (error) {
+        console.log(error);
+        res.json({success:false,message:error.message});
+    
+  }
+}
+
+//API to get a single show from the database
+export const getShow=async(req,res)=>{
+  try {
+    const {movieId}=req.params;
+
+    const movie = await Movie.findOne({ imdbId: movieId });
+    if (!movie) {
+      return res.status(404).json({ success: false, message: "Movie not found" });
+    }
+
+
+    //get all upcoming shows for the movie
+    const shows=await Show.find({movie:movie._id,showDateTime:{$gte:new Date()}})
+
+    // const movie = await Movie.findOne({ imdbId: movieId });
+
+    const dateTime={};
+
+    shows.forEach((show)=>{
+      const date=show.showDateTime.toISOString().split("T")[0];
+      if(!dateTime[date]){
+        dateTime[date]=[]
+      }
+      dateTime[date].push({time:show.showDateTime,showId:show._id})
+    })
+    res.json({success:true,movie:dateTime})
+  } catch (error) {
+    console.log(error);
+        res.json({success:false,message:error.message});
+  }
+}
